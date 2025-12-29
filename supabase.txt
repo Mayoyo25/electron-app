@@ -1,0 +1,211 @@
+-- SUPABASE DATABASE SCHEMA
+-- Copy this into Supabase SQL Editor
+
+-- Enable UUID extension
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+-- ======================
+-- USER LICENSES TABLE
+-- ======================
+CREATE TABLE user_licenses (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  email TEXT NOT NULL UNIQUE,
+  license_key TEXT NOT NULL UNIQUE,
+  purchase_id TEXT UNIQUE,
+  
+  -- Credits
+  credits_total DECIMAL(10,2) DEFAULT 0 NOT NULL,
+  credits_remaining DECIMAL(10,2) DEFAULT 0 NOT NULL,
+  
+  -- Timestamps
+  activated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  last_used TIMESTAMP WITH TIME ZONE,
+  
+  -- Metadata
+  app_version TEXT,
+  platform TEXT, -- 'mac', 'windows', 'linux'
+  
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Index for fast lookups
+CREATE INDEX idx_license_key ON user_licenses(license_key);
+CREATE INDEX idx_email ON user_licenses(email);
+
+-- ======================
+-- USAGE LOGS TABLE
+-- ======================
+CREATE TABLE usage_logs (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  license_key TEXT NOT NULL REFERENCES user_licenses(license_key) ON DELETE CASCADE,
+  
+  -- Session info
+  session_id UUID NOT NULL,
+  session_date TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  
+  -- Usage metrics
+  api_calls INTEGER DEFAULT 0,
+  cost_usd DECIMAL(10,4) DEFAULT 0,
+  
+  -- Session details
+  duration_seconds INTEGER,
+  screenshots_captured INTEGER DEFAULT 0,
+  
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Index for analytics
+CREATE INDEX idx_usage_license ON usage_logs(license_key);
+CREATE INDEX idx_usage_date ON usage_logs(session_date);
+
+-- ======================
+-- USER DOCUMENTS TABLE
+-- ======================
+CREATE TABLE documents (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  license_key TEXT NOT NULL REFERENCES user_licenses(license_key) ON DELETE CASCADE,
+  
+  -- File info
+  file_name TEXT NOT NULL,
+  file_path TEXT NOT NULL, -- Supabase storage path
+  file_type TEXT NOT NULL,
+  file_size INTEGER NOT NULL,
+  
+  -- Extracted content
+  extracted_text TEXT,
+  processing_status TEXT DEFAULT 'pending', -- 'pending', 'processing', 'complete', 'error'
+  
+  -- Timestamps
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Index for user's documents
+CREATE INDEX idx_documents_license ON documents(license_key);
+CREATE INDEX idx_documents_created ON documents(created_at DESC);
+
+-- ======================
+-- AI ANALYSIS LOGS (Optional - for debugging)
+-- ======================
+CREATE TABLE analysis_logs (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  license_key TEXT NOT NULL REFERENCES user_licenses(license_key) ON DELETE CASCADE,
+  session_id UUID NOT NULL,
+  
+  -- Analysis details
+  screenshot_timestamp TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  prompt_tokens INTEGER,
+  completion_tokens INTEGER,
+  total_cost DECIMAL(10,4),
+  
+  -- Response (optional - can be large)
+  response_text TEXT,
+  
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE INDEX idx_analysis_session ON analysis_logs(session_id);
+
+-- ======================
+-- ROW LEVEL SECURITY (RLS)
+-- ======================
+-- Enable RLS on all tables
+ALTER TABLE user_licenses ENABLE ROW LEVEL SECURITY;
+ALTER TABLE usage_logs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
+ALTER TABLE analysis_logs ENABLE ROW LEVEL SECURITY;
+
+-- Policy: Users can only access their own data
+-- Note: In desktop app, we'll use service role key to bypass RLS
+-- But if you add a web dashboard later, these policies protect data
+
+CREATE POLICY "Users can view own license"
+  ON user_licenses FOR SELECT
+  USING (license_key = current_setting('app.current_license_key', true));
+
+CREATE POLICY "Users can view own documents"
+  ON documents FOR SELECT
+  USING (license_key = current_setting('app.current_license_key', true));
+
+CREATE POLICY "Users can view own usage"
+  ON usage_logs FOR SELECT
+  USING (license_key = current_setting('app.current_license_key', true));
+
+-- ======================
+-- STORAGE BUCKET
+-- ======================
+-- Run this in Supabase Storage section:
+-- 1. Create bucket: 'user-documents'
+-- 2. Make it private (not public)
+-- 3. Set max file size: 50MB
+
+-- Storage policies (paste in Supabase Storage Policies)
+-- CREATE POLICY "Users can upload own documents"
+--   ON storage.objects FOR INSERT
+--   WITH CHECK (bucket_id = 'user-documents');
+
+-- CREATE POLICY "Users can view own documents"
+--   ON storage.objects FOR SELECT
+--   USING (bucket_id = 'user-documents');
+
+-- ======================
+-- HELPER FUNCTIONS
+-- ======================
+
+-- Function to deduct credits
+CREATE OR REPLACE FUNCTION deduct_credits(
+  p_license_key TEXT,
+  p_amount DECIMAL
+)
+RETURNS DECIMAL AS $$
+DECLARE
+  new_balance DECIMAL;
+BEGIN
+  UPDATE user_licenses
+  SET 
+    credits_remaining = credits_remaining - p_amount,
+    last_used = NOW()
+  WHERE license_key = p_license_key
+  RETURNING credits_remaining INTO new_balance;
+  
+  RETURN new_balance;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Function to get user stats
+CREATE OR REPLACE FUNCTION get_user_stats(p_license_key TEXT)
+RETURNS TABLE (
+  total_sessions BIGINT,
+  total_api_calls BIGINT,
+  total_cost DECIMAL,
+  total_documents BIGINT,
+  last_session TIMESTAMP WITH TIME ZONE
+) AS $$
+BEGIN
+  RETURN QUERY
+  SELECT 
+    COUNT(DISTINCT session_id)::BIGINT as total_sessions,
+    SUM(api_calls)::BIGINT as total_api_calls,
+    SUM(cost_usd)::DECIMAL as total_cost,
+    (SELECT COUNT(*) FROM documents WHERE license_key = p_license_key)::BIGINT as total_documents,
+    MAX(session_date) as last_session
+  FROM usage_logs
+  WHERE license_key = p_license_key;
+END;
+$$ LANGUAGE plpgsql;
+
+-- ======================
+-- SAMPLE DATA (for testing)
+-- ======================
+-- Uncomment to insert test data
+
+-- INSERT INTO user_licenses (email, license_key, purchase_id, credits_total, credits_remaining)
+-- VALUES 
+--   ('test@example.com', 'TEST-1234-5678-ABCD', 'gumroad_test_123', 100, 100);
+
+-- ======================
+-- INDEXES FOR PERFORMANCE
+-- ======================
+CREATE INDEX idx_usage_logs_composite ON usage_logs(license_key, session_date DESC);
+CREATE INDEX idx_documents_composite ON documents(license_key, created_at DESC);
